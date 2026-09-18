@@ -3,10 +3,12 @@
 Authenticate by oauth2: verifies a token by introspection at the authorization server. A technology of
 [xmip-core-authenticate](https://github.com/IlleNilsson/xmip-core-authenticate).
 
-Declared and not yet written; `architecture.toml` carries the maturity. When
-it is written it implements `Authenticator`, one mechanism at one gate (ADR-0050).
-What it may depend on is `repository-model.md` section 4 and ADR-0044: its
-capability, and no sibling.
+It asks the authorization server's RFC 7662 introspection endpoint whether a
+token is active, and checks `exp`, the required scopes and that `sub` is the
+claim. It makes the call over plain HTTP only where configuration says the node
+is online or the endpoint is loopback, and refuses saying why otherwise
+(ADR-0045); HTTPS to the endpoint and local JWT access-token validation are not
+covered.
 
 ## Toolchain
 
