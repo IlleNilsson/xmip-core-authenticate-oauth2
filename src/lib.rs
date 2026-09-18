@@ -25,6 +25,14 @@
 //! is `jwt`'s gate and not this one; TLS to the endpoint is the host's (see
 //! [`Introspection`]); the scopes are checked here and not carried onward,
 //! because `Verified` has no place for them.
+//!
+//! A node that expects one account says so with
+//! [`Verifier::expecting_principal`]: the answer's `username` is then read
+//! as the identify capability's `UserPrincipalName` and must be the same
+//! account, however either was spelled (ADR-0054). A service is expected by
+//! its `client_id` with [`Verifier::expecting_client`], compared as text: a
+//! client id is whatever the server issued, often a GUID, and is no service
+//! principal name.
 
 pub mod introspection;
 
@@ -32,6 +40,7 @@ pub use introspection::{Http, Introspection};
 
 use authenticate::{AuthenticateError, Authenticator, Presented};
 use context::Verified;
+use identify::UserPrincipalName;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xcore::{Mechanism, mechanism};
@@ -59,6 +68,8 @@ pub struct Verifier {
     issuer: Option<String>,
     audience: Option<String>,
     scopes: Vec<String>,
+    principal: Option<UserPrincipalName>,
+    client: Option<String>,
     leeway: i64,
     clock: Clock,
 }
@@ -73,6 +84,8 @@ impl Verifier {
             issuer: None,
             audience: None,
             scopes: Vec::new(),
+            principal: None,
+            client: None,
             leeway: 60,
             clock: Box::new(now),
         }
@@ -96,6 +109,21 @@ impl Verifier {
     #[must_use]
     pub fn requiring_scope(mut self, scope: impl Into<String>) -> Self {
         self.scopes.push(scope.into());
+        self
+    }
+
+    /// Refuse a token whose `username` is not this account. Any spelling of
+    /// the same account meets it.
+    #[must_use]
+    pub fn expecting_principal(mut self, principal: UserPrincipalName) -> Self {
+        self.principal = Some(principal);
+        self
+    }
+
+    /// Refuse a token whose `client_id` is not this, compared as text.
+    #[must_use]
+    pub fn expecting_client(mut self, client: impl Into<String>) -> Self {
+        self.client = Some(client.into());
         self
     }
 
@@ -181,6 +209,38 @@ impl Verifier {
     }
 }
 
+/// Where an account or a client is expected, the answer names it.
+fn check_names(verifier: &Verifier, answer: &Value) -> Result<(), AuthenticateError> {
+    let text = |name: &str| answer.get(name).and_then(Value::as_str);
+
+    if let Some(expected) = &verifier.principal {
+        let username = text("username").unwrap_or_default();
+        match UserPrincipalName::parse(username) {
+            Some(named) if named.is(expected) => {}
+            Some(named) => {
+                return Err(AuthenticateError::new(format!(
+                    "the token's username is '{named}' and this node expects '{expected}'"
+                )));
+            }
+            None => {
+                return Err(AuthenticateError::new(format!(
+                    "the token's username '{username}' is not a user principal name and \
+                     this node expects '{expected}'"
+                )));
+            }
+        }
+    }
+    if let Some(expected) = &verifier.client
+        && text("client_id") != Some(expected.as_str())
+    {
+        return Err(AuthenticateError::new(format!(
+            "the token's client_id is '{}' and this node expects '{expected}'",
+            text("client_id").unwrap_or_default()
+        )));
+    }
+    Ok(())
+}
+
 /// Whether an `aud`, a string or an array of them, names `audience`.
 fn names(aud: Option<&Value>, audience: &str) -> bool {
     match aud {
@@ -216,6 +276,7 @@ impl Authenticator for Verifier {
             AuthenticateError::new(format!("the introspection response is not JSON: {failure}"))
         })?;
         self.check(&answer, &presented.value)?;
+        check_names(self, &answer)?;
 
         Ok(Verified::Proven)
     }
@@ -318,6 +379,54 @@ mod tests {
         assert!(request.starts_with("POST /introspect HTTP/1.1\r\n"));
         assert!(request.contains("Authorization: Basic eG1pcC1ub2RlOnMzY3JldA=="));
         assert!(request.ends_with("token=mF_9.B5f-4%2F1JqM&token_type_hint=access_token"));
+    }
+
+    fn jane() -> UserPrincipalName {
+        UserPrincipalName::parse("PARTNERX\\jane").expect("a name")
+    }
+
+    #[test]
+    fn a_username_spelled_another_way_is_the_account_the_node_expects() {
+        let client = "2f1c9a0e-5b7d-4c3a-9e21-0d6b8a4f7c55";
+        let extra = format!(r#","username":"Jane@PartnerX","client_id":"{client}""#);
+        let (url, _asked) = server("200 OK", active(&extra));
+
+        let verified = verifier(&url)
+            .expecting_principal(jane())
+            .expecting_client(client)
+            .verify(&presented("opaque"));
+
+        assert_eq!(verified.expect("proven"), Verified::Proven);
+    }
+
+    #[test]
+    fn another_account_and_another_client_are_each_refused_naming_both() {
+        let extra = r#","username":"mallory@partnerx","client_id":"reports""#;
+        let (url, _asked) = server("200 OK", active(extra));
+        let account = verifier(&url)
+            .expecting_principal(jane())
+            .verify(&presented("opaque"))
+            .expect_err("refused");
+        let (url, _asked) = server("200 OK", active(extra));
+        let client = verifier(&url)
+            .expecting_client("Reports")
+            .verify(&presented("opaque"))
+            .expect_err("refused");
+        let (url, _asked) = server("200 OK", active(r#","username":"jane""#));
+        let bare = verifier(&url)
+            .expecting_principal(jane())
+            .verify(&presented("opaque"))
+            .expect_err("refused");
+
+        assert_eq!(
+            account.message,
+            "the token's username is 'mallory@partnerx' and this node expects 'jane@partnerx'"
+        );
+        assert_eq!(
+            client.message,
+            "the token's client_id is 'reports' and this node expects 'Reports'"
+        );
+        assert!(bare.message.contains("'jane' is not a user principal name"));
     }
 
     #[test]
