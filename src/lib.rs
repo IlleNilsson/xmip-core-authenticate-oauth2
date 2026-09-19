@@ -23,8 +23,13 @@
 //!
 //! What this does not cover: a JWT access token validated locally (RFC 9068)
 //! is `jwt`'s gate and not this one; TLS to the endpoint is the host's (see
-//! [`Introspection`]); the scopes are checked here and not carried onward,
-//! because `Verified` has no place for them.
+//! [`Introspection`]).
+//!
+//! What the server answered is learned and handed to the gate in the
+//! `Conclusion`: the token's `scope` under the name `authorize/scope` reads,
+//! its `client_id` as [`CLIENT`], and its `username` as `principal.user`
+//! where it is a user principal name. None of it was claimed; an opaque
+//! token says nothing until the server is asked.
 //!
 //! A node that expects one account says so with
 //! [`Verifier::expecting_principal`]: the answer's `username` is then read
@@ -38,7 +43,8 @@ pub mod introspection;
 
 pub use introspection::{Http, Introspection};
 
-use authenticate::{AuthenticateError, Authenticator, Presented};
+use authenticate::conclusion::SCOPE;
+use authenticate::{AuthenticateError, Authenticator, Conclusion, Presented};
 use context::Verified;
 use identify::UserPrincipalName;
 use serde_json::Value;
@@ -49,6 +55,8 @@ use xcore::{Mechanism, mechanism};
 pub const TOKEN: &str = "oauth2.token";
 /// The proof name `identify/header` gives a token read off `Authorization`.
 pub const BEARER_TOKEN: &str = "bearer.token";
+/// The evidence name the token's `client_id` is learned under.
+pub const CLIENT: &str = "oauth2.client";
 
 type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
 
@@ -256,6 +264,11 @@ impl Authenticator for Verifier {
     }
 
     fn verify(&self, presented: &Presented) -> Result<Verified, AuthenticateError> {
+        self.conclude(presented)
+            .map(|conclusion| conclusion.verified)
+    }
+
+    fn conclude(&self, presented: &Presented) -> Result<Conclusion, AuthenticateError> {
         let name = presented.mechanism.name();
         if name != self.mechanism().name() {
             return Err(AuthenticateError::new(format!(
@@ -278,8 +291,31 @@ impl Authenticator for Verifier {
         self.check(&answer, &presented.value)?;
         check_names(self, &answer)?;
 
-        Ok(Verified::Proven)
+        Ok(learned_from(&answer))
     }
+}
+
+/// What an active token's answer teaches the gate.
+fn learned_from(answer: &Value) -> Conclusion {
+    let text = |name: &str| {
+        answer
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|said| !said.is_empty())
+    };
+    let mut conclusion = Conclusion::proven();
+
+    if let Some(scope) = text("scope") {
+        conclusion = conclusion.learning(SCOPE, scope);
+    }
+    if let Some(client) = text("client_id") {
+        conclusion = conclusion.learning(CLIENT, client);
+    }
+    if let Some(user) = text("username").and_then(UserPrincipalName::parse) {
+        conclusion = conclusion.learning(identify::principal::USER, user.to_string());
+    }
+
+    conclusion
 }
 
 #[cfg(test)]
@@ -379,6 +415,24 @@ mod tests {
         assert!(request.starts_with("POST /introspect HTTP/1.1\r\n"));
         assert!(request.contains("Authorization: Basic eG1pcC1ub2RlOnMzY3JldA=="));
         assert!(request.ends_with("token=mF_9.B5f-4%2F1JqM&token_type_hint=access_token"));
+    }
+
+    #[test]
+    fn what_the_server_answered_is_learned_and_handed_to_the_gate() {
+        let extra = r#","username":"PARTNERX\\jane","client_id":"xmip-partner""#;
+        let (url, _asked) = server("200 OK", active(extra));
+
+        let conclusion = verifier(&url)
+            .conclude(&presented("mF_9.B5f-4/1JqM"))
+            .expect("proven");
+
+        assert_eq!(conclusion.verified, Verified::Proven);
+        assert_eq!(conclusion.learned(SCOPE), Some("orders:read orders:write"));
+        assert_eq!(conclusion.learned(CLIENT), Some("xmip-partner"));
+        assert_eq!(
+            conclusion.learned(identify::principal::USER),
+            Some("jane@partnerx")
+        );
     }
 
     fn jane() -> UserPrincipalName {
