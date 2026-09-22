@@ -47,14 +47,13 @@ use authenticate::conclusion::SCOPE;
 use authenticate::{AuthenticateError, Authenticator, Conclusion, Presented};
 use context::Verified;
 use identify::UserPrincipalName;
+use identify::authorization::BEARER_TOKEN;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xcore::{Mechanism, mechanism};
 
 /// The proof an oauth2 claim carries its token under.
 pub const TOKEN: &str = "oauth2.token";
-/// The proof name `identify/header` gives a token read off `Authorization`.
-pub const BEARER_TOKEN: &str = "bearer.token";
 /// The evidence name the token's `client_id` is learned under.
 pub const CLIENT: &str = "oauth2.client";
 
