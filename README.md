@@ -5,7 +5,10 @@ Authenticate by oauth2: verifies a token by introspection at the authorization s
 
 It asks the authorization server's RFC 7662 introspection endpoint whether a
 token is active, and checks `exp`, the required scopes and that `sub` is the
-claim. It makes the call over plain HTTP only where configuration says the node
+claim. It makes the call over plain HTTP, through the estate's minimal
+HTTP/1.1 client in
+[xmip-core-library-net](https://github.com/IlleNilsson/xmip-core-library-net),
+only where configuration says the node
 is online or the endpoint is loopback, and refuses saying why otherwise
 (ADR-0045); HTTPS to the endpoint and local JWT access-token validation are not
 covered.

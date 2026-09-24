@@ -44,8 +44,9 @@ pub mod introspection;
 pub use introspection::{Http, Introspection};
 
 use authenticate::clock::{Clock, Window};
-use authenticate::{AuthenticateError, Authenticator, Conclusion, Presented};
+use authenticate::{AuthenticateError, Authenticator, Conclusion};
 use context::Verified;
+use identify::Presented;
 use identify::UserPrincipalName;
 use identify::evidence::{self, BEARER_TOKEN, SCOPE};
 use serde_json::Value;
