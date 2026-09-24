@@ -43,31 +43,18 @@ pub mod introspection;
 
 pub use introspection::{Http, Introspection};
 
-use authenticate::conclusion::SCOPE;
+use authenticate::clock::{Clock, Window};
 use authenticate::{AuthenticateError, Authenticator, Conclusion, Presented};
 use context::Verified;
 use identify::UserPrincipalName;
-use identify::authorization::BEARER_TOKEN;
+use identify::evidence::{self, BEARER_TOKEN, SCOPE};
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
 use xcore::{Mechanism, mechanism};
 
 /// The proof an oauth2 claim carries its token under.
 pub const TOKEN: &str = "oauth2.token";
 /// The evidence name the token's `client_id` is learned under.
 pub const CLIENT: &str = "oauth2.client";
-
-type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
-
-/// Seconds since the Unix epoch, now.
-#[must_use]
-pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
-        })
-}
 
 /// The oauth2 authenticator: where to ask, and what the answer must say.
 pub struct Verifier {
@@ -77,7 +64,6 @@ pub struct Verifier {
     scopes: Vec<String>,
     principal: Option<UserPrincipalName>,
     client: Option<String>,
-    leeway: i64,
     clock: Clock,
 }
 
@@ -93,8 +79,7 @@ impl Verifier {
             scopes: Vec::new(),
             principal: None,
             client: None,
-            leeway: 60,
-            clock: Box::new(now),
+            clock: Clock::system(60),
         }
     }
 
@@ -136,22 +121,20 @@ impl Verifier {
 
     /// How far a clock may be off before `exp` and `nbf` bite.
     #[must_use]
-    pub const fn with_leeway(mut self, seconds: i64) -> Self {
-        self.leeway = seconds;
+    pub fn with_leeway(mut self, seconds: i64) -> Self {
+        self.clock = self.clock.forgiving(seconds);
         self
     }
 
     /// Where the time comes from; the tests pin it.
     #[must_use]
     pub fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
-        self.clock = Box::new(clock);
+        self.clock = self.clock.reading(clock);
         self
     }
 
     fn check(&self, answer: &Value, subject: &str) -> Result<(), AuthenticateError> {
         let text = |name: &str| answer.get(name).and_then(Value::as_str);
-        let now = (self.clock)();
-
         match answer.get("active").and_then(Value::as_bool) {
             Some(true) => {}
             Some(false) => {
@@ -166,20 +149,10 @@ impl Verifier {
                 ));
             }
         }
-        if let Some(expiry) = answer.get("exp").and_then(Value::as_i64)
-            && now > expiry.saturating_add(self.leeway)
-        {
-            return Err(AuthenticateError::new(format!(
-                "the token expired at {expiry} and it is {now}"
-            )));
-        }
-        if let Some(not_before) = answer.get("nbf").and_then(Value::as_i64)
-            && now.saturating_add(self.leeway) < not_before
-        {
-            return Err(AuthenticateError::new(format!(
-                "the token is not valid before {not_before} and it is {now}"
-            )));
-        }
+        let at = |name: &str| answer.get(name).and_then(Value::as_i64);
+        self.clock
+            .admits(Window::between(at("nbf"), at("exp")))
+            .map_err(|outside| AuthenticateError::new(format!("the token {outside}")))?;
         if let Some(issuer) = &self.issuer
             && text("iss") != Some(issuer.as_str())
         {
@@ -276,7 +249,7 @@ impl Authenticator for Verifier {
         }
         let token = presented
             .proof(TOKEN)
-            .or_else(|| presented.proof(BEARER_TOKEN))
+            .or_else(|| presented.proof(evidence::BEARER_TOKEN))
             .ok_or_else(|| {
                 AuthenticateError::new(format!(
                     "no {TOKEN} proof and no {BEARER_TOKEN} proof was presented"
@@ -311,7 +284,7 @@ fn learned_from(answer: &Value) -> Conclusion {
         conclusion = conclusion.learning(CLIENT, client);
     }
     if let Some(user) = text("username").and_then(UserPrincipalName::parse) {
-        conclusion = conclusion.learning(identify::principal::USER, user.to_string());
+        conclusion = conclusion.learning(evidence::PRINCIPAL_USER, user.to_string());
     }
 
     conclusion
@@ -429,7 +402,7 @@ mod tests {
         assert_eq!(conclusion.learned(SCOPE), Some("orders:read orders:write"));
         assert_eq!(conclusion.learned(CLIENT), Some("xmip-partner"));
         assert_eq!(
-            conclusion.learned(identify::principal::USER),
+            conclusion.learned(evidence::PRINCIPAL_USER),
             Some("jane@partnerx")
         );
     }
@@ -509,7 +482,7 @@ mod tests {
     fn a_bearer_proof_is_read_and_a_subject_that_is_not_the_claim_is_refused() {
         let (url, _asked) = server("200 OK", active(""));
         let claim = Presented::passed(mechanism::oauth2(), "someone-else")
-            .with_proof(BEARER_TOKEN, "token");
+            .with_proof(evidence::BEARER_TOKEN, "token");
 
         let failure = verifier(&url).verify(&claim).expect_err("refused");
 

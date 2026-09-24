@@ -17,8 +17,6 @@
 //! the refusal says which of the two would change it.
 
 use authenticate::AuthenticateError;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
@@ -174,7 +172,7 @@ impl Http {
             .client
             .as_ref()
             .map_or_else(String::new, |(id, secret)| {
-                let credential = STANDARD.encode(format!("{id}:{secret}"));
+                let credential = codec::base64::encode(format!("{id}:{secret}").as_bytes());
                 format!("Authorization: Basic {credential}\r\n")
             });
         format!(
