@@ -3,12 +3,12 @@
 //!
 //! [`Introspection`] is the seam: given a token it answers the JSON the
 //! server said. [`Http`] is the implementation this crate carries — one
-//! `POST` of `token=<token>` as a form over plain HTTP/1.1 on a TCP
-//! connection it opens and closes, with the client credentials RFC 7662
-//! section 2.1 requires as HTTP Basic. It speaks no TLS: an `https` endpoint
-//! is refused when it is configured, with the reason, and a host that
-//! terminates TLS in front of this node implements [`Introspection`] over
-//! its own client instead.
+//! `POST` of `token=<token>` as a form over the estate's minimal HTTP/1.1
+//! client, `net::http`, on a TCP connection it opens and closes, with the
+//! client credentials RFC 7662 section 2.1 requires as HTTP Basic. It
+//! speaks no TLS: an `https` endpoint is refused when it is configured,
+//! with the reason, and a host that terminates TLS in front of this node
+//! implements [`Introspection`] over its own client instead.
 //!
 //! Offline is the default (ADR-0045). [`Http`] opens a connection only where
 //! the endpoint is loopback — an address in `127.0.0.0/8`, `::1`, or the
@@ -17,8 +17,9 @@
 //! the refusal says which of the two would change it.
 
 use authenticate::AuthenticateError;
-use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use net::Endpoint;
+use net::http::{self, Request};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 /// Asks an authorization server about one token.
@@ -35,9 +36,7 @@ pub trait Introspection: Send + Sync {
 /// The introspection endpoint over plain HTTP/1.1.
 #[derive(Clone)]
 pub struct Http {
-    host: String,
-    port: u16,
-    path: String,
+    endpoint: Endpoint,
     client: Option<(String, String)>,
     online: bool,
     timeout: Duration,
@@ -49,9 +48,7 @@ pub struct Http {
 impl std::fmt::Debug for Http {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Http")
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("path", &self.path)
+            .field("endpoint", &self.endpoint)
             .field("client", &self.client.as_ref().map(|(id, _)| id))
             .field("online", &self.online)
             .finish()
@@ -64,45 +61,15 @@ impl Http {
     ///
     /// # Errors
     ///
-    /// Where the URL is `https` — this client speaks no TLS — or is not an
-    /// `http` URL with a host.
+    /// Where the URL is not an `http` URL with a host — an `https` one
+    /// among them, since this client speaks no TLS: give the verifier an
+    /// [`Introspection`] over the host's TLS client instead.
     pub fn at(url: &str) -> Result<Self, AuthenticateError> {
-        if url.starts_with("https://") {
-            return Err(AuthenticateError::new(format!(
-                "the introspection endpoint '{url}' is https and this client speaks plain \
-                 HTTP only: give the verifier an Introspection over the host's TLS client"
-            )));
-        }
-        let rest = url.strip_prefix("http://").ok_or_else(|| {
-            AuthenticateError::new(format!(
-                "the introspection endpoint '{url}' is not an http URL"
-            ))
+        let endpoint = Endpoint::parse(url, 80).map_err(|refused| {
+            AuthenticateError::new(format!("the introspection endpoint {refused}"))
         })?;
-        let (authority, path) = match rest.find('/') {
-            Some(at) => (&rest[..at], &rest[at..]),
-            None => (rest, "/"),
-        };
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) if !port.contains(']') => (
-                host,
-                port.parse::<u16>().map_err(|_| {
-                    AuthenticateError::new(format!(
-                        "the introspection endpoint '{url}' has a port that is not a number"
-                    ))
-                })?,
-            ),
-            _ => (authority, 80),
-        };
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        if host.is_empty() {
-            return Err(AuthenticateError::new(format!(
-                "the introspection endpoint '{url}' names no host"
-            )));
-        }
         Ok(Self {
-            host: host.to_string(),
-            port,
-            path: path.to_string(),
+            endpoint,
             client: None,
             online: false,
             timeout: Duration::from_secs(5),
@@ -132,153 +99,78 @@ impl Http {
 
     /// The addresses this node may connect to, given what it may reach.
     fn reachable(&self) -> Result<Vec<SocketAddr>, AuthenticateError> {
-        let literal = self.host.parse::<IpAddr>().ok();
-        let names_loopback = literal.is_some_and(|address| address.is_loopback())
-            || self.host.eq_ignore_ascii_case("localhost");
-        if !self.online && !names_loopback {
+        let host = self.endpoint.host();
+        if !self.online && !self.endpoint.names_loopback() {
             return Err(AuthenticateError::new(format!(
-                "the node is offline (ADR-0045) and the introspection endpoint '{}' is not \
-                 loopback: configure the node online, or an endpoint on this host",
-                self.host
+                "the node is offline (ADR-0045) and the introspection endpoint '{host}' is not \
+                 loopback: configure the node online, or an endpoint on this host"
             )));
         }
-        let resolved: Vec<SocketAddr> = (self.host.as_str(), self.port)
-            .to_socket_addrs()
+        let resolved: Vec<SocketAddr> = self
+            .endpoint
+            .resolve()
             .map_err(|failure| {
-                AuthenticateError::new(format!(
-                    "the introspection endpoint '{}' does not resolve: {failure}",
-                    self.host
-                ))
+                AuthenticateError::new(format!("the introspection endpoint {failure}"))
             })?
+            .into_iter()
             .filter(|address| self.online || address.ip().is_loopback())
             .collect();
         if resolved.is_empty() {
             return Err(AuthenticateError::new(format!(
-                "the node is offline (ADR-0045) and '{}' resolves to no loopback address",
-                self.host
+                "the node is offline (ADR-0045) and '{host}' resolves to no loopback address"
             )));
         }
         Ok(resolved)
     }
 
-    fn request(&self, token: &str) -> String {
-        let body = format!("token={}&token_type_hint=access_token", form_encoded(token));
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        let authorization = self
-            .client
-            .as_ref()
-            .map_or_else(String::new, |(id, secret)| {
+    fn request(&self, token: &str) -> Request {
+        let body = format!(
+            "token={}&token_type_hint=access_token",
+            net::percent::encode(token, false)
+        );
+        let request = Request::new("POST", self.endpoint.path())
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body.as_bytes());
+        match &self.client {
+            Some((id, secret)) => {
                 let credential = codec::base64::encode(format!("{id}:{secret}").as_bytes());
-                format!("Authorization: Basic {credential}\r\n")
-            });
-        format!(
-            "POST {} HTTP/1.1\r\nHost: {host}:{}\r\nAccept: application/json\r\n\
-             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-             Connection: close\r\n{authorization}\r\n{body}",
-            self.path,
-            self.port,
-            body.len()
-        )
+                request.header("Authorization", &format!("Basic {credential}"))
+            }
+            None => request,
+        }
     }
 }
 
 impl Introspection for Http {
     fn introspect(&self, token: &str) -> Result<String, AuthenticateError> {
-        let unreachable = |failure: std::io::Error| {
-            AuthenticateError::new(format!(
-                "the introspection endpoint {}:{} did not answer: {failure}",
-                self.host, self.port
-            ))
-        };
         let addresses = self.reachable()?;
-        let mut stream = addresses
-            .iter()
-            .find_map(|address| TcpStream::connect_timeout(address, self.timeout).ok())
-            .ok_or_else(|| {
+        let answer = http::connect(&addresses, self.timeout)
+            .and_then(|stream| {
+                http::exchange(stream, &self.endpoint.authority(), &self.request(token))
+            })
+            .map_err(|failure| {
                 AuthenticateError::new(format!(
-                    "the introspection endpoint {}:{} refused the connection",
-                    self.host, self.port
+                    "the introspection endpoint {} did not answer: {failure}",
+                    self.endpoint.authority()
                 ))
             })?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .map_err(unreachable)?;
-        stream
-            .write_all(self.request(token).as_bytes())
-            .map_err(unreachable)?;
-
-        let mut answer = Vec::new();
-        stream.read_to_end(&mut answer).map_err(unreachable)?;
-        response_body(&String::from_utf8_lossy(&answer))
+        judged(&answer)
     }
 }
 
-/// The body of a `200`, de-chunked where the server chunked it.
-fn response_body(answer: &str) -> Result<String, AuthenticateError> {
-    let (head, body) = answer.split_once("\r\n\r\n").ok_or_else(|| {
-        AuthenticateError::new("the introspection endpoint's answer is not an HTTP response")
-    })?;
-    let mut lines = head.lines();
-    let status = lines.next().unwrap_or_default();
-    let code = status.split_whitespace().nth(1).unwrap_or_default();
-    if code != "200" {
-        return Err(AuthenticateError::new(match code {
-            "401" | "403" => format!(
-                "the authorization server refused this node's client credentials: '{status}'"
-            ),
-            _ => format!("the introspection endpoint answered '{status}' and not 200"),
-        }));
+/// The body of a `200`; any other status refused, naming it.
+fn judged(answer: &http::Response) -> Result<String, AuthenticateError> {
+    let status = &answer.status_line;
+    match answer.status {
+        200 => Ok(answer.text()),
+        401 | 403 => Err(AuthenticateError::new(format!(
+            "the authorization server refused this node's client credentials: '{status}'"
+        ))),
+        _ => Err(AuthenticateError::new(format!(
+            "the introspection endpoint answered '{status}' and not 200"
+        ))),
     }
-    let chunked = lines.any(|line| {
-        line.split_once(':').is_some_and(|(name, value)| {
-            name.eq_ignore_ascii_case("transfer-encoding")
-                && value.to_ascii_lowercase().contains("chunked")
-        })
-    });
-    if chunked {
-        unchunked(body)
-    } else {
-        Ok(body.to_string())
-    }
-}
-
-fn unchunked(mut body: &str) -> Result<String, AuthenticateError> {
-    let broken = || AuthenticateError::new("the introspection endpoint's chunked body is broken");
-    let mut whole = String::new();
-    loop {
-        let (size, rest) = body.split_once("\r\n").ok_or_else(broken)?;
-        let size = size.split(';').next().unwrap_or_default().trim();
-        let size = usize::from_str_radix(size, 16).map_err(|_| broken())?;
-        if size == 0 {
-            return Ok(whole);
-        }
-        whole.push_str(rest.get(..size).ok_or_else(broken)?);
-        body = rest
-            .get(size..)
-            .and_then(|after| after.strip_prefix("\r\n"))
-            .ok_or_else(broken)?;
-    }
-}
-
-/// `application/x-www-form-urlencoded`: everything but the unreserved set is
-/// a percent escape.
-fn form_encoded(text: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-    }
-    encoded
 }
 
 #[cfg(test)]
@@ -286,10 +178,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_https_endpoint_is_refused_when_it_is_configured_and_says_what_to_do() {
+    fn an_https_endpoint_is_refused_when_it_is_configured_and_says_why() {
         let failure = Http::at("https://as.example/introspect").expect_err("refused");
 
-        assert!(failure.message.contains("plain HTTP only"));
+        assert!(failure.message.contains("plain HTTP/1.1 only"), "{failure}");
     }
 
     #[test]
@@ -307,34 +199,42 @@ mod tests {
         let endpoint = Http::at("http://[::1]:9000/oauth/introspect").expect("a URL");
         let plain = Http::at("http://localhost").expect("a URL");
 
-        assert_eq!(
-            (
-                endpoint.host.as_str(),
-                endpoint.port,
-                endpoint.path.as_str()
-            ),
-            ("::1", 9000, "/oauth/introspect")
-        );
-        assert_eq!((plain.port, plain.path.as_str()), (80, "/"));
+        assert_eq!(endpoint.endpoint.authority(), "[::1]:9000");
+        assert_eq!(endpoint.endpoint.path(), "/oauth/introspect");
+        assert_eq!((plain.endpoint.port(), plain.endpoint.path()), (80, "/"));
     }
 
     #[test]
-    fn a_chunked_body_is_put_back_together_and_a_401_names_the_credentials() {
-        let chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
-                       8\r\n{\"active\r\n7\r\n\":true}\r\n0\r\n\r\n";
-        let denied = "HTTP/1.1 401 Unauthorized\r\n\r\n";
+    fn a_401_names_the_credentials_and_another_status_names_itself() {
+        let answer = |status: u16, line: &str| http::Response {
+            status,
+            status_line: line.to_string(),
+            ..http::Response::default()
+        };
 
-        assert_eq!(response_body(chunked).expect("a body"), "{\"active\":true}");
         assert!(
-            response_body(denied)
+            judged(&answer(401, "HTTP/1.1 401 Unauthorized"))
                 .expect_err("refused")
                 .message
                 .contains("client credentials")
+        );
+        assert!(
+            judged(&answer(503, "HTTP/1.1 503 Service Unavailable"))
+                .expect_err("refused")
+                .message
+                .contains("'HTTP/1.1 503 Service Unavailable' and not 200")
         );
     }
 
     #[test]
     fn a_token_is_form_encoded_so_its_punctuation_survives_the_post() {
-        assert_eq!(form_encoded("a+b/c=d.e-f"), "a%2Bb%2Fc%3Dd.e-f");
+        let request = Http::at("http://localhost/introspect")
+            .expect("a URL")
+            .request("a+b/c=d.e-f");
+
+        assert_eq!(
+            request.body,
+            b"token=a%2Bb%2Fc%3Dd.e-f&token_type_hint=access_token"
+        );
     }
 }
