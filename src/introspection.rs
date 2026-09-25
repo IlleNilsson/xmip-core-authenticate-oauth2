@@ -65,9 +65,11 @@ impl Http {
     /// among them, since this client speaks no TLS: give the verifier an
     /// [`Introspection`] over the host's TLS client instead.
     pub fn at(url: &str) -> Result<Self, AuthenticateError> {
-        let endpoint = Endpoint::parse(url, 80).map_err(|refused| {
-            AuthenticateError::new(format!("the introspection endpoint {refused}"))
-        })?;
+        let endpoint = Endpoint::parse(url)
+            .and_then(Endpoint::plain)
+            .map_err(|refused| {
+                AuthenticateError::new(format!("the introspection endpoint {refused}"))
+            })?;
         Ok(Self {
             endpoint,
             client: None,
@@ -129,6 +131,7 @@ impl Http {
             net::percent::encode(token, false)
         );
         let request = Request::new("POST", self.endpoint.path())
+            .header("Host", &self.endpoint.authority())
             .header("Accept", "application/json")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body.as_bytes());
@@ -146,9 +149,7 @@ impl Introspection for Http {
     fn introspect(&self, token: &str) -> Result<String, AuthenticateError> {
         let addresses = self.reachable()?;
         let answer = http::connect(&addresses, self.timeout)
-            .and_then(|stream| {
-                http::exchange(stream, &self.endpoint.authority(), &self.request(token))
-            })
+            .and_then(|stream| http::exchange(stream, &self.request(token)))
             .map_err(|failure| {
                 AuthenticateError::new(format!(
                     "the introspection endpoint {} did not answer: {failure}",
@@ -161,7 +162,7 @@ impl Introspection for Http {
 
 /// The body of a `200`; any other status refused, naming it.
 fn judged(answer: &http::Response) -> Result<String, AuthenticateError> {
-    let status = &answer.status_line;
+    let status = format!("{} {}", answer.status, answer.reason);
     match answer.status {
         200 => Ok(answer.text()),
         401 | 403 => Err(AuthenticateError::new(format!(
@@ -206,23 +207,23 @@ mod tests {
 
     #[test]
     fn a_401_names_the_credentials_and_another_status_names_itself() {
-        let answer = |status: u16, line: &str| http::Response {
+        let answer = |status: u16, reason: &str| http::Response {
             status,
-            status_line: line.to_string(),
+            reason: reason.to_string(),
             ..http::Response::default()
         };
 
         assert!(
-            judged(&answer(401, "HTTP/1.1 401 Unauthorized"))
+            judged(&answer(401, "Unauthorized"))
                 .expect_err("refused")
                 .message
                 .contains("client credentials")
         );
         assert!(
-            judged(&answer(503, "HTTP/1.1 503 Service Unavailable"))
+            judged(&answer(503, "Service Unavailable"))
                 .expect_err("refused")
                 .message
-                .contains("'HTTP/1.1 503 Service Unavailable' and not 200")
+                .contains("'503 Service Unavailable' and not 200")
         );
     }
 
