@@ -13,6 +13,8 @@ is online or the endpoint is loopback, and refuses saying why otherwise
 (ADR-0045); HTTPS to the endpoint and local JWT access-token validation are not
 covered.
 
+The introspection endpoint is connected to through `net::connect`, the estate's one TCP connect.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
