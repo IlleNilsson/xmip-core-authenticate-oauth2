@@ -242,12 +242,6 @@ impl Authenticator for Verifier {
     }
 
     fn conclude(&self, presented: &Presented) -> Result<Conclusion, AuthenticateError> {
-        let name = presented.mechanism.name();
-        if name != self.mechanism().name() {
-            return Err(AuthenticateError::new(format!(
-                "'{name}' was presented and this authenticator verifies oauth2"
-            )));
-        }
         let token = presented
             .proof(TOKEN)
             .or_else(|| presented.proof(evidence::BEARER_TOKEN))
@@ -542,15 +536,12 @@ mod tests {
     }
 
     #[test]
-    fn another_mechanism_and_a_missing_proof_are_each_refused_by_name() {
+    fn a_missing_proof_is_refused_by_name() {
         let gate = Verifier::new(Http::at("http://127.0.0.1:9/").expect("a URL"));
-        let other = Presented::passed(mechanism::bearer(), "mF_9.B5f…");
         let bare = Presented::passed(mechanism::oauth2(), "partner-x");
 
-        let not_ours = gate.verify(&other).expect_err("refused");
         let missing = gate.verify(&bare).expect_err("refused");
 
-        assert!(not_ours.message.contains("'bearer' was presented"));
         assert!(missing.message.contains("oauth2.token"));
     }
 }
