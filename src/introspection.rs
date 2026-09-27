@@ -148,7 +148,7 @@ impl Http {
 impl Introspection for Http {
     fn introspect(&self, token: &str) -> Result<String, AuthenticateError> {
         let addresses = self.reachable()?;
-        let answer = http::connect(&addresses, self.timeout)
+        let answer = net::connect(&addresses[..], Some(self.timeout))
             .and_then(|stream| http::exchange(stream, &self.request(token)))
             .map_err(|failure| {
                 AuthenticateError::new(format!(
