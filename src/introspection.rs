@@ -164,7 +164,9 @@ impl Introspection for Http {
 fn judged(answer: &http::Response) -> Result<String, AuthenticateError> {
     let status = format!("{} {}", answer.status, answer.reason);
     match answer.status {
-        200 => Ok(answer.text()),
+        200 => answer.text().map(str::to_string).map_err(|refused| {
+            AuthenticateError::new(format!("the introspection endpoint's answer: {refused}"))
+        }),
         401 | 403 => Err(AuthenticateError::new(format!(
             "the authorization server refused this node's client credentials: '{status}'"
         ))),
