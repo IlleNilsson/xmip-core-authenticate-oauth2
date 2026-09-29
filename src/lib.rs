@@ -349,7 +349,7 @@ mod tests {
         let exp = NOW + 300;
         format!(
             concat!(
-                r#"{{"active":true,"sub":"partner-x","#,
+                r#"{{"active":true,"sub":"party-x","#,
                 r#""scope":"orders:read orders:write","exp":{exp}{extra}}}"#
             ),
             exp = exp,
@@ -365,7 +365,7 @@ mod tests {
     }
 
     fn presented(token: &str) -> Presented {
-        Presented::passed(mechanism::oauth2(), "partner-x").with_proof(TOKEN, token)
+        Presented::passed(mechanism::oauth2(), "party-x").with_proof(TOKEN, token)
     }
 
     #[test]
@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn what_the_server_answered_is_learned_and_handed_to_the_gate() {
-        let extra = r#","username":"PARTNERX\\jane","client_id":"xmip-partner""#;
+        let extra = r#","username":"PARTYX\\jane","client_id":"xmip-party""#;
         let (url, _asked) = server("200 OK", active(extra));
 
         let conclusion = verifier(&url)
@@ -395,21 +395,21 @@ mod tests {
 
         assert_eq!(conclusion.verified, Verified::Proven);
         assert_eq!(conclusion.learned(SCOPE), Some("orders:read orders:write"));
-        assert_eq!(conclusion.learned(CLIENT), Some("xmip-partner"));
+        assert_eq!(conclusion.learned(CLIENT), Some("xmip-party"));
         assert_eq!(
             conclusion.learned(evidence::PRINCIPAL_USER),
-            Some("jane@partnerx")
+            Some("jane@partyx")
         );
     }
 
     fn jane() -> UserPrincipalName {
-        UserPrincipalName::parse("PARTNERX\\jane").expect("a name")
+        UserPrincipalName::parse("PARTYX\\jane").expect("a name")
     }
 
     #[test]
     fn a_username_spelled_another_way_is_the_account_the_node_expects() {
         let client = "2f1c9a0e-5b7d-4c3a-9e21-0d6b8a4f7c55";
-        let extra = format!(r#","username":"Jane@PartnerX","client_id":"{client}""#);
+        let extra = format!(r#","username":"Jane@PartyX","client_id":"{client}""#);
         let (url, _asked) = server("200 OK", active(&extra));
 
         let verified = verifier(&url)
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn another_account_and_another_client_are_each_refused_naming_both() {
-        let extra = r#","username":"mallory@partnerx","client_id":"reports""#;
+        let extra = r#","username":"mallory@partyx","client_id":"reports""#;
         let (url, _asked) = server("200 OK", active(extra));
         let account = verifier(&url)
             .expecting_principal(jane())
@@ -441,7 +441,7 @@ mod tests {
 
         assert_eq!(
             account.message,
-            "the token's username is 'mallory@partnerx' and this node expects 'jane@partnerx'"
+            "the token's username is 'mallory@partyx' and this node expects 'jane@partyx'"
         );
         assert_eq!(
             client.message,
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn an_answer_the_server_has_let_expire_is_refused_by_its_expiry() {
-        let answer = format!(r#"{{"active":true,"sub":"partner-x","exp":{}}}"#, NOW - 300);
+        let answer = format!(r#"{{"active":true,"sub":"party-x","exp":{}}}"#, NOW - 300);
         let (url, _asked) = server("200 OK", answer);
 
         let failure = verifier(&url)
@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn a_missing_proof_is_refused_by_name() {
         let gate = Verifier::new(Http::at("http://127.0.0.1:9/").expect("a URL"));
-        let bare = Presented::passed(mechanism::oauth2(), "partner-x");
+        let bare = Presented::passed(mechanism::oauth2(), "party-x");
 
         let missing = gate.verify(&bare).expect_err("refused");
 
