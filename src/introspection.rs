@@ -128,7 +128,7 @@ impl Http {
     fn request(&self, token: &str) -> Request {
         let body = format!(
             "token={}&token_type_hint=access_token",
-            net::percent::encode(token, false)
+            codec::percent::encode(token, false)
         );
         let request = Request::new("POST", self.endpoint.path())
             .header("Host", &self.endpoint.authority())
