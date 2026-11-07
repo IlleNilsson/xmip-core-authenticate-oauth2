@@ -324,7 +324,7 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).expect("a response");
             asked
-                .send(String::from_utf8_lossy(&request).into_owned())
+                .send(String::from_utf8_lossy_owned(request))
                 .expect("a listener");
         });
 
