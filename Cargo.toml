@@ -38,6 +38,14 @@ codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNil
 # The endpoint, the minimal HTTP/1.1 client the call goes over, and the
 # percent-encoding of the token in the form body.
 net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
+# The estate's TLS, which an https endpoint is asked in: the token and the
+# client secret never cross a network in the clear.
+tls = { package = "xmip-core-library-tls", git = "https://github.com/IlleNilsson/xmip-core-library-tls", branch = "main" }
+
+[dev-dependencies]
+# A self-signed certificate for the in-process authorization server the TLS
+# test stands up.
+rcgen = "0.14"
 
 [lints.rust]
 # forbid, not deny: a module has no business writing unsafe. The one exception
