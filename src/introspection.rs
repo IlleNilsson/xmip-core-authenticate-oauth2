@@ -5,10 +5,15 @@
 //! server said. [`Http`] is the implementation this crate carries — one
 //! `POST` of `token=<token>` as a form over the estate's minimal HTTP/1.1
 //! client, `net::http`, on a TCP connection it opens and closes, with the
-//! client credentials RFC 7662 section 2.1 requires as HTTP Basic. It
-//! speaks no TLS: an `https` endpoint is refused when it is configured,
-//! with the reason, and a host that terminates TLS in front of this node
-//! implements [`Introspection`] over its own client instead.
+//! client credentials RFC 7662 section 2.1 requires as HTTP Basic.
+//!
+//! **TLS, except to this host.** The token and the client secret are both
+//! credentials, so an `https` endpoint is reached through the estate's TLS
+//! (`xmip-core-library-tls`), against the operating system's trust store or
+//! the one the configuration gives ([`Http::trusting`]). A plain `http`
+//! endpoint is refused when it is configured unless it names loopback, and
+//! is then reached only at a loopback address: the credentials never cross
+//! a network in the clear.
 //!
 //! Offline is the default (ADR-0045). [`Http`] opens a connection only where
 //! the endpoint is loopback — an address in `127.0.0.0/8`, `::1`, or the
@@ -20,6 +25,7 @@ use authenticate::AuthenticateError;
 use net::Endpoint;
 use net::http::{self, Request};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Asks an authorization server about one token.
@@ -33,13 +39,15 @@ pub trait Introspection: Send + Sync {
     fn introspect(&self, token: &str) -> Result<String, AuthenticateError>;
 }
 
-/// The introspection endpoint over plain HTTP/1.1.
+/// The introspection endpoint over HTTP/1.1: in TLS, or in the clear to
+/// loopback alone.
 #[derive(Clone)]
 pub struct Http {
     endpoint: Endpoint,
     client: Option<(String, String)>,
     online: bool,
     timeout: Duration,
+    trust: Option<Arc<tls::ClientConfig>>,
 }
 
 // The client secret does not belong in a log line; the client id says whose
@@ -56,26 +64,44 @@ impl std::fmt::Debug for Http {
 }
 
 impl Http {
-    /// The endpoint at `url`: `http://host[:port]/path`. The node is taken
-    /// to be offline, no client credentials, five seconds to answer.
+    /// The endpoint at `url`: `https://host[:port]/path`, or
+    /// `http://` to loopback. The node is taken to be offline, no client
+    /// credentials, five seconds to answer, the operating system's trust
+    /// store.
     ///
     /// # Errors
     ///
-    /// Where the URL is not an `http` URL with a host — an `https` one
-    /// among them, since this client speaks no TLS: give the verifier an
-    /// [`Introspection`] over the host's TLS client instead.
+    /// Where the URL is not an `http` or `https` URL with a host, and where
+    /// it is `http` to a host that is not loopback: the token and the
+    /// client secret would cross a network in the clear.
     pub fn at(url: &str) -> Result<Self, AuthenticateError> {
-        let endpoint = Endpoint::parse(url)
-            .and_then(Endpoint::plain)
-            .map_err(|refused| {
-                AuthenticateError::new(format!("the introspection endpoint {refused}"))
-            })?;
+        let endpoint = Endpoint::parse(url).map_err(|refused| {
+            AuthenticateError::new(format!("the introspection endpoint {refused}"))
+        })?;
+        if !endpoint.secure() && !endpoint.names_loopback() {
+            return Err(AuthenticateError::new(format!(
+                "the introspection endpoint '{url}' is plain HTTP to '{}', which is not \
+                 loopback: the token and the client secret would cross the network in the \
+                 clear; use https",
+                endpoint.host()
+            )));
+        }
         Ok(Self {
             endpoint,
             client: None,
             online: false,
             timeout: Duration::from_secs(5),
+            trust: None,
         })
+    }
+
+    /// Verify the server's certificate against this trust store, the
+    /// authorization server's own certificate authority, rather than the
+    /// operating system's.
+    #[must_use]
+    pub fn trusting(mut self, config: Arc<tls::ClientConfig>) -> Self {
+        self.trust = Some(config);
+        self
     }
 
     /// The configuration says this node may reach beyond itself.
@@ -115,14 +141,33 @@ impl Http {
                 AuthenticateError::new(format!("the introspection endpoint {failure}"))
             })?
             .into_iter()
-            .filter(|address| self.online || address.ip().is_loopback())
+            .filter(|address| (self.online && self.endpoint.secure()) || address.ip().is_loopback())
             .collect();
         if resolved.is_empty() {
             return Err(AuthenticateError::new(format!(
-                "the node is offline (ADR-0045) and '{host}' resolves to no loopback address"
+                "'{host}' resolves to no loopback address, and the node is offline (ADR-0045) \
+                 or the endpoint is plain HTTP"
             )));
         }
         Ok(resolved)
+    }
+
+    /// One exchange over `tcp`: in TLS where the endpoint is `https`.
+    fn exchange(
+        &self,
+        tcp: std::net::TcpStream,
+        request: &Request,
+    ) -> Result<http::Response, String> {
+        if !self.endpoint.secure() {
+            return http::exchange(tcp, request).map_err(|failure| failure.to_string());
+        }
+        let host = self.endpoint.host();
+        let guarded = match &self.trust {
+            Some(config) => tls::client_with(host, tcp, Arc::clone(config)),
+            None => tls::client(host, tcp),
+        }
+        .map_err(|failure| failure.message)?;
+        http::exchange(guarded, request).map_err(|failure| failure.to_string())
     }
 
     fn request(&self, token: &str) -> Request {
@@ -149,7 +194,8 @@ impl Introspection for Http {
     fn introspect(&self, token: &str) -> Result<String, AuthenticateError> {
         let addresses = self.reachable()?;
         let answer = net::connect(&addresses[..], Some(self.timeout))
-            .and_then(|stream| http::exchange(stream, &self.request(token)))
+            .map_err(|failure| failure.to_string())
+            .and_then(|stream| self.exchange(stream, &self.request(token)))
             .map_err(|failure| {
                 AuthenticateError::new(format!(
                     "the introspection endpoint {} did not answer: {failure}",
@@ -181,15 +227,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_https_endpoint_is_refused_when_it_is_configured_and_says_why() {
-        let failure = Http::at("https://as.example/introspect").expect_err("refused");
+    fn plain_http_beyond_this_host_is_refused_when_it_is_configured_and_says_why() {
+        let failure = Http::at("http://as.example/introspect").expect_err("refused");
 
-        assert!(failure.message.contains("plain HTTP/1.1 only"), "{failure}");
+        assert!(failure.message.contains("in the clear"), "{failure}");
+        assert!(Http::at("https://as.example/introspect").is_ok());
+        assert!(Http::at("http://127.0.0.1:9/introspect").is_ok());
+    }
+
+    #[test]
+    fn an_https_endpoint_is_asked_in_tls_and_answers_through_it() {
+        let signed = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("a certificate");
+        let config = tls::server_config(
+            signed.cert.pem().as_bytes(),
+            signed.signing_key.serialize_pem().as_bytes(),
+        )
+        .expect("a server");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bound");
+        let port = listener.local_addr().expect("an address").port();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("a connection");
+            let mut guarded = tls::server(tcp, Arc::new(config)).expect("tls");
+            let request = http::read_request(&mut std::io::BufReader::new(&mut guarded))
+                .expect("read")
+                .expect("a request");
+            let answer = http::Response::new(200).body(br#"{"active":false}"#);
+            http::write_response(&mut guarded, &answer).expect("answered");
+            std::io::Write::flush(&mut guarded).expect("flushed");
+            request.path
+        });
+        let trust = tls::trusting(signed.cert.pem().as_bytes()).expect("a trust store");
+
+        let answer = Http::at(&format!("https://localhost:{port}/introspect"))
+            .expect("a URL")
+            .trusting(Arc::new(trust))
+            .introspect("t")
+            .expect("answered");
+
+        assert_eq!(answer, r#"{"active":false}"#);
+        assert_eq!(server.join().expect("served"), "/introspect");
     }
 
     #[test]
     fn an_offline_node_refuses_an_endpoint_beyond_itself_and_says_why() {
-        let endpoint = Http::at("http://as.example:8080/introspect").expect("a URL");
+        let endpoint = Http::at("https://as.example:8443/introspect").expect("a URL");
 
         let failure = endpoint.introspect("token").expect_err("refused");
 

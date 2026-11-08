@@ -21,9 +21,12 @@
 //! cached: every verification is one call, so a token revoked at the server
 //! is refused at the next arrival.
 //!
-//! What this does not cover: a JWT access token validated locally (RFC 9068)
-//! is `jwt`'s gate and not this one; TLS to the endpoint is the host's (see
-//! [`Introspection`]).
+//! The endpoint is asked in TLS, the estate's own, and in the clear only on
+//! loopback (see [`introspection`]). The issuer, audience and window checks
+//! are the capability's (`authenticate::claims`), the ones `jwt`, `oidc` and
+//! `saml` make too; `exp` is held where the answer gives one, RFC 7662
+//! making it optional beside the server's own `active`. A JWT access token
+//! validated locally (RFC 9068) is `jwt`'s gate and not this one.
 //!
 //! What the server answered is learned and handed to the gate in the
 //! `Conclusion`: the token's `scope` under the name `authorize/scope` reads,
@@ -43,6 +46,7 @@ pub mod introspection;
 
 pub use introspection::{Http, Introspection};
 
+use authenticate::claims;
 use authenticate::clock::{Clock, Window};
 use authenticate::{AuthenticateError, Authenticator, Conclusion};
 use context::Verified;
@@ -151,22 +155,18 @@ impl Verifier {
             }
         }
         let at = |name: &str| answer.get(name).and_then(Value::as_i64);
-        self.clock
-            .admits(Window::between(at("nbf"), at("exp")))
-            .map_err(|outside| AuthenticateError::new(format!("the token {outside}")))?;
-        if let Some(issuer) = &self.issuer
-            && text("iss") != Some(issuer.as_str())
-        {
-            return Err(AuthenticateError::new(format!(
-                "the token's issuer is not '{issuer}'"
-            )));
+        // RFC 7662 section 2.2 makes `exp` optional: `active` is the
+        // server's own verdict, and the window is held where it is given.
+        claims::within(
+            "the token",
+            &self.clock,
+            Window::between(at("nbf"), at("exp")),
+        )?;
+        if let Some(issuer) = &self.issuer {
+            claims::issued_by("the token", text("iss"), issuer)?;
         }
-        if let Some(audience) = &self.audience
-            && !names(answer.get("aud"), audience)
-        {
-            return Err(AuthenticateError::new(format!(
-                "the token's audience does not name '{audience}'"
-            )));
+        if let Some(audience) = &self.audience {
+            claims::addressed_to("the token", audiences(answer.get("aud")), audience)?;
         }
         let granted: Vec<&str> = text("scope").unwrap_or_default().split(' ').collect();
         if let Some(missing) = self
@@ -222,12 +222,12 @@ fn check_names(verifier: &Verifier, answer: &Value) -> Result<(), AuthenticateEr
     Ok(())
 }
 
-/// Whether an `aud`, a string or an array of them, names `audience`.
-fn names(aud: Option<&Value>, audience: &str) -> bool {
+/// The audiences an `aud` names, a string or an array of them.
+fn audiences(aud: Option<&Value>) -> Vec<&str> {
     match aud {
-        Some(Value::String(one)) => one == audience,
-        Some(Value::Array(many)) => many.iter().any(|one| one.as_str() == Some(audience)),
-        _ => false,
+        Some(Value::String(one)) => vec![one.as_str()],
+        Some(Value::Array(many)) => many.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn an_offline_node_does_not_call_a_server_beyond_itself() {
-        let endpoint = Http::at("http://as.example/introspect").expect("a URL");
+        let endpoint = Http::at("https://as.example/introspect").expect("a URL");
 
         let failure = Verifier::new(endpoint)
             .verify(&presented("token"))

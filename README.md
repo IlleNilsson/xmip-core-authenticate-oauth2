@@ -4,16 +4,20 @@ Authenticate by oauth2: verifies a token by introspection at the authorization s
 [xmip-core-authenticate](https://github.com/IlleNilsson/xmip-core-authenticate).
 
 It asks the authorization server's RFC 7662 introspection endpoint whether a
-token is active, and checks `exp`, the required scopes and that `sub` is the
-claim. It makes the call over plain HTTP, through the estate's minimal
-HTTP/1.1 client in
-[xmip-core-library-net](https://github.com/IlleNilsson/xmip-core-library-net),
-only where configuration says the node
-is online or the endpoint is loopback, and refuses saying why otherwise
-(ADR-0045); HTTPS to the endpoint and local JWT access-token validation are not
-covered.
+token is active, and checks the window `nbf` and `exp` give where the answer
+gives them, the issuer and audience where they are expected — the checks of
+`authenticate::claims`, which `jwt`, `oidc` and `saml` make too — the
+required scopes, and that `sub` is the claim.
 
-The introspection endpoint is connected to through `net::connect`, the estate's one TCP connect.
+The call goes through the estate's minimal HTTP/1.1 client in
+[xmip-core-library-net](https://github.com/IlleNilsson/xmip-core-library-net)
+and, for an `https` endpoint, the estate's TLS in
+[xmip-core-library-tls](https://github.com/IlleNilsson/xmip-core-library-tls),
+against the operating system's trust store or one the configuration gives. A
+plain `http` endpoint is refused unless it is loopback, and is then reached
+only at a loopback address. The call is made only where configuration says
+the node is online or the endpoint is loopback, and is refused saying why
+otherwise (ADR-0045). Local JWT access-token validation is `jwt`'s.
 
 ## Toolchain
 
