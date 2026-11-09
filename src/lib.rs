@@ -21,8 +21,10 @@
 //! cached: every verification is one call, so a token revoked at the server
 //! is refused at the next arrival.
 //!
-//! The endpoint is asked in TLS, the estate's own, and in the clear only on
-//! loopback (see [`introspection`]). The issuer, audience and window checks
+//! The endpoint is asked in TLS, Xmip's own, and a plain `http` endpoint is
+//! refused when it is configured, loopback included (see [`introspection`]);
+//! the endpoint and the leeway are the `introspection_endpoint` and `leeway`
+//! settings declared in [`settings`]. The issuer, audience and window checks
 //! are the capability's (`authenticate::claims`), the ones `jwt`, `oidc` and
 //! `saml` make too; `exp` is held where the answer gives one, RFC 7662
 //! making it optional beside the server's own `active`. A JWT access token
@@ -43,8 +45,10 @@
 //! principal name.
 
 pub mod introspection;
+pub mod settings;
 
 pub use introspection::{Http, Introspection};
+pub use settings::SETTINGS;
 
 use authenticate::claims;
 use authenticate::clock::{Clock, Window};
@@ -73,21 +77,6 @@ pub struct Verifier {
 }
 
 impl Verifier {
-    /// Asks `server`, expecting no issuer, audience or scope, with sixty
-    /// seconds of leeway.
-    #[must_use]
-    pub fn new(server: impl Introspection + 'static) -> Self {
-        Self {
-            server: Box::new(server),
-            issuer: None,
-            audience: None,
-            scopes: Vec::new(),
-            principal: None,
-            client: None,
-            clock: Clock::system(60),
-        }
-    }
-
     /// Refuse a token whose `iss` is not this.
     #[must_use]
     pub fn expecting_issuer(mut self, issuer: impl Into<String>) -> Self {
@@ -290,24 +279,35 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
     use std::thread;
 
     const NOW: i64 = 1_800_000_000;
 
-    /// An authorization server on loopback that answers one introspection
-    /// request the way RFC 7662 section 2.2 says, and hands back what it was
-    /// asked.
-    fn server(status: &'static str, answer: String) -> (String, mpsc::Receiver<String>) {
+    /// An authorization server on loopback, in TLS under a certificate for
+    /// `127.0.0.1`, that answers one introspection request the way RFC 7662
+    /// section 2.2 says and hands back what it was asked; and the endpoint
+    /// that trusts it. The address, not `localhost`: Windows takes seconds to
+    /// refuse the `::1` that name resolves to first.
+    fn server(status: &'static str, answer: String) -> (Http, mpsc::Receiver<String>) {
+        let signed = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+            .expect("a certificate");
+        let config = tls::server_config(
+            signed.cert.pem().as_bytes(),
+            signed.signing_key.serialize_pem().as_bytes(),
+        )
+        .expect("a server");
+        let trust = tls::trusting(signed.cert.pem().as_bytes()).expect("a trust store");
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let url = format!(
-            "http://{}/introspect",
-            listener.local_addr().expect("an address")
+            "https://127.0.0.1:{}/introspect",
+            listener.local_addr().expect("an address").port()
         );
         let (asked, received) = mpsc::channel();
 
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("a connection");
+            let (tcp, _) = listener.accept().expect("a connection");
+            let mut stream = tls::server(tcp, Arc::new(config)).expect("tls");
             let mut request = Vec::new();
             let mut buffer = [0u8; 1024];
             while !complete(&request) {
@@ -323,12 +323,14 @@ mod tests {
                 answer.len()
             );
             stream.write_all(response.as_bytes()).expect("a response");
+            stream.flush().expect("flushed");
             asked
                 .send(String::from_utf8_lossy_owned(request))
                 .expect("a listener");
         });
 
-        (url, received)
+        let endpoint = Http::at(&url).expect("a URL").trusting(Arc::new(trust));
+        (endpoint, received)
     }
 
     /// Head and the `Content-Length` it promises have both arrived.
@@ -357,11 +359,8 @@ mod tests {
         )
     }
 
-    fn verifier(url: &str) -> Verifier {
-        let endpoint = Http::at(url)
-            .expect("a URL")
-            .as_client("xmip-node", "s3cret");
-        Verifier::new(endpoint).with_clock(|| NOW)
+    fn verifier(endpoint: Http) -> Verifier {
+        Verifier::new(endpoint.as_client("xmip-node", "s3cret")).with_clock(|| NOW)
     }
 
     fn presented(token: &str) -> Presented {
@@ -370,9 +369,9 @@ mod tests {
 
     #[test]
     fn an_active_token_is_proven_by_asking_the_server_over_loopback() {
-        let (url, asked) = server("200 OK", active(""));
+        let (endpoint, asked) = server("200 OK", active(""));
 
-        let verified = verifier(&url)
+        let verified = verifier(endpoint)
             .requiring_scope("orders:read")
             .verify(&presented("mF_9.B5f-4/1JqM"))
             .expect("proven");
@@ -387,9 +386,9 @@ mod tests {
     #[test]
     fn what_the_server_answered_is_learned_and_handed_to_the_gate() {
         let extra = r#","username":"PARTYX\\jane","client_id":"xmip-party""#;
-        let (url, _asked) = server("200 OK", active(extra));
+        let (endpoint, _asked) = server("200 OK", active(extra));
 
-        let conclusion = verifier(&url)
+        let conclusion = verifier(endpoint)
             .conclude(&presented("mF_9.B5f-4/1JqM"))
             .expect("proven");
 
@@ -410,9 +409,9 @@ mod tests {
     fn a_username_spelled_another_way_is_the_account_the_node_expects() {
         let client = "2f1c9a0e-5b7d-4c3a-9e21-0d6b8a4f7c55";
         let extra = format!(r#","username":"Jane@PartyX","client_id":"{client}""#);
-        let (url, _asked) = server("200 OK", active(&extra));
+        let (endpoint, _asked) = server("200 OK", active(&extra));
 
-        let verified = verifier(&url)
+        let verified = verifier(endpoint)
             .expecting_principal(jane())
             .expecting_client(client)
             .verify(&presented("opaque"));
@@ -423,18 +422,18 @@ mod tests {
     #[test]
     fn another_account_and_another_client_are_each_refused_naming_both() {
         let extra = r#","username":"mallory@partyx","client_id":"reports""#;
-        let (url, _asked) = server("200 OK", active(extra));
-        let account = verifier(&url)
+        let (endpoint, _asked) = server("200 OK", active(extra));
+        let account = verifier(endpoint)
             .expecting_principal(jane())
             .verify(&presented("opaque"))
             .expect_err("refused");
-        let (url, _asked) = server("200 OK", active(extra));
-        let client = verifier(&url)
+        let (endpoint, _asked) = server("200 OK", active(extra));
+        let client = verifier(endpoint)
             .expecting_client("Reports")
             .verify(&presented("opaque"))
             .expect_err("refused");
-        let (url, _asked) = server("200 OK", active(r#","username":"jane""#));
-        let bare = verifier(&url)
+        let (endpoint, _asked) = server("200 OK", active(r#","username":"jane""#));
+        let bare = verifier(endpoint)
             .expecting_principal(jane())
             .verify(&presented("opaque"))
             .expect_err("refused");
@@ -452,9 +451,9 @@ mod tests {
 
     #[test]
     fn a_token_the_server_calls_inactive_is_refused_as_such() {
-        let (url, _asked) = server("200 OK", r#"{"active":false}"#.to_string());
+        let (endpoint, _asked) = server("200 OK", r#"{"active":false}"#.to_string());
 
-        let failure = verifier(&url)
+        let failure = verifier(endpoint)
             .verify(&presented("revoked"))
             .expect_err("refused");
 
@@ -463,9 +462,9 @@ mod tests {
 
     #[test]
     fn a_token_without_a_required_scope_is_refused_by_the_scope() {
-        let (url, _asked) = server("200 OK", active(""));
+        let (endpoint, _asked) = server("200 OK", active(""));
 
-        let failure = verifier(&url)
+        let failure = verifier(endpoint)
             .requiring_scope("orders:delete")
             .verify(&presented("token"))
             .expect_err("refused");
@@ -475,11 +474,11 @@ mod tests {
 
     #[test]
     fn a_bearer_proof_is_read_and_a_subject_that_is_not_the_claim_is_refused() {
-        let (url, _asked) = server("200 OK", active(""));
+        let (endpoint, _asked) = server("200 OK", active(""));
         let claim = Presented::passed(mechanism::oauth2(), "someone-else")
             .with_proof(evidence::BEARER_TOKEN, "token");
 
-        let failure = verifier(&url).verify(&claim).expect_err("refused");
+        let failure = verifier(endpoint).verify(&claim).expect_err("refused");
 
         assert!(failure.message.contains("subject"));
     }
@@ -487,9 +486,9 @@ mod tests {
     #[test]
     fn an_answer_the_server_has_let_expire_is_refused_by_its_expiry() {
         let answer = format!(r#"{{"active":true,"sub":"party-x","exp":{}}}"#, NOW - 300);
-        let (url, _asked) = server("200 OK", answer);
+        let (endpoint, _asked) = server("200 OK", answer);
 
-        let failure = verifier(&url)
+        let failure = verifier(endpoint)
             .verify(&presented("token"))
             .expect_err("refused");
 
@@ -498,13 +497,13 @@ mod tests {
 
     #[test]
     fn another_audience_is_refused_and_an_array_of_audiences_is_read() {
-        let (url, _asked) = server("200 OK", active(r#","aud":["billing","xmip"]"#));
+        let (endpoint, _asked) = server("200 OK", active(r#","aud":["billing","xmip"]"#));
         let (other, _asked_other) = server("200 OK", active(r#","aud":"billing""#));
 
-        let named = verifier(&url)
+        let named = verifier(endpoint)
             .expecting_audience("xmip")
             .verify(&presented("token"));
-        let failure = verifier(&other)
+        let failure = verifier(other)
             .expecting_audience("xmip")
             .verify(&presented("token"))
             .expect_err("refused");
@@ -514,14 +513,14 @@ mod tests {
     }
 
     #[test]
-    fn a_server_that_refuses_the_nodes_credentials_is_named_as_the_reason() {
-        let (url, _asked) = server("401 Unauthorized", String::new());
+    fn a_server_that_refuses_the_nodes_client_secret_is_named_as_the_reason() {
+        let (endpoint, _asked) = server("401 Unauthorized", String::new());
 
-        let failure = verifier(&url)
+        let failure = verifier(endpoint)
             .verify(&presented("token"))
             .expect_err("refused");
 
-        assert!(failure.message.contains("client credentials"));
+        assert!(failure.message.contains("client id and secret"));
     }
 
     #[test]
@@ -537,7 +536,7 @@ mod tests {
 
     #[test]
     fn a_missing_proof_is_refused_by_name() {
-        let gate = Verifier::new(Http::at("http://127.0.0.1:9/").expect("a URL"));
+        let gate = Verifier::new(Http::at("https://127.0.0.1:9/").expect("a URL"));
         let bare = Presented::passed(mechanism::oauth2(), "party-x");
 
         let missing = gate.verify(&bare).expect_err("refused");

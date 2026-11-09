@@ -9,15 +9,25 @@ gives them, the issuer and audience where they are expected — the checks of
 `authenticate::claims`, which `jwt`, `oidc` and `saml` make too — the
 required scopes, and that `sub` is the claim.
 
-The call goes through the estate's minimal HTTP/1.1 client in
-[xmip-core-library-net](https://github.com/IlleNilsson/xmip-core-library-net)
-and, for an `https` endpoint, the estate's TLS in
+The call goes through Xmip's minimal HTTP/1.1 client in
+[xmip-core-library-net](https://github.com/IlleNilsson/xmip-core-library-net),
+always in Xmip's TLS in
 [xmip-core-library-tls](https://github.com/IlleNilsson/xmip-core-library-tls),
 against the operating system's trust store or one the configuration gives. A
-plain `http` endpoint is refused unless it is loopback, and is then reached
-only at a loopback address. The call is made only where configuration says
-the node is online or the endpoint is loopback, and is refused saying why
-otherwise (ADR-0045). Local JWT access-token validation is `jwt`'s.
+plain `http` endpoint is refused when it is configured, loopback included:
+the token and the client's secret are never sent in the clear. The call is
+made only where configuration says the node is online or the endpoint is
+loopback, and is refused saying why otherwise (ADR-0045). Local JWT
+access-token validation is `jwt`'s.
+
+Its settings are declared in `settings.rs` through `xcore::settings`:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `introspection_endpoint` | required | The authorization server's introspection endpoint (RFC 7662), an `https` URL; plain `http` is refused. |
+| `leeway` | `60s` | How far a clock may be off before an answer's `exp` and `nbf` bite. |
+
+The client's id and secret are given apart from these.
 
 ## Toolchain
 

@@ -5,15 +5,15 @@
 //! server said. [`Http`] is the implementation this crate carries — one
 //! `POST` of `token=<token>` as a form over the estate's minimal HTTP/1.1
 //! client, `net::http`, on a TCP connection it opens and closes, with the
-//! client credentials RFC 7662 section 2.1 requires as HTTP Basic.
+//! client's secret RFC 7662 section 2.1 requires as HTTP Basic.
 //!
-//! **TLS, except to this host.** The token and the client secret are both
-//! credentials, so an `https` endpoint is reached through the estate's TLS
+//! **TLS, always.** The token and the client's secret both prove something,
+//! so the endpoint must be `https` and is reached through Xmip's own TLS
 //! (`xmip-core-library-tls`), against the operating system's trust store or
 //! the one the configuration gives ([`Http::trusting`]). A plain `http`
-//! endpoint is refused when it is configured unless it names loopback, and
-//! is then reached only at a loopback address: the credentials never cross
-//! a network in the clear.
+//! endpoint is refused when it is configured, loopback included: any process
+//! on the host may listen on a loopback port, and TLS is what proves the
+//! server is the authorization server.
 //!
 //! Offline is the default (ADR-0045). [`Http`] opens a connection only where
 //! the endpoint is loopback — an address in `127.0.0.0/8`, `::1`, or the
@@ -39,8 +39,7 @@ pub trait Introspection: Send + Sync {
     fn introspect(&self, token: &str) -> Result<String, AuthenticateError>;
 }
 
-/// The introspection endpoint over HTTP/1.1: in TLS, or in the clear to
-/// loopback alone.
+/// The introspection endpoint over HTTP/1.1 in TLS.
 #[derive(Clone)]
 pub struct Http {
     endpoint: Endpoint,
@@ -64,25 +63,23 @@ impl std::fmt::Debug for Http {
 }
 
 impl Http {
-    /// The endpoint at `url`: `https://host[:port]/path`, or
-    /// `http://` to loopback. The node is taken to be offline, no client
-    /// credentials, five seconds to answer, the operating system's trust
-    /// store.
+    /// The endpoint at `url`: `https://host[:port]/path`. The node is taken
+    /// to be offline, no client secret, five seconds to answer, the
+    /// operating system's trust store.
     ///
     /// # Errors
     ///
-    /// Where the URL is not an `http` or `https` URL with a host, and where
-    /// it is `http` to a host that is not loopback: the token and the
-    /// client secret would cross a network in the clear.
+    /// Where the URL is not an `https` URL with a host: a plain `http` one,
+    /// loopback included, would carry the token and the client's secret in
+    /// the clear to whoever listens there.
     pub fn at(url: &str) -> Result<Self, AuthenticateError> {
         let endpoint = Endpoint::parse(url).map_err(|refused| {
             AuthenticateError::new(format!("the introspection endpoint {refused}"))
         })?;
-        if !endpoint.secure() && !endpoint.names_loopback() {
+        if !endpoint.secure() {
             return Err(AuthenticateError::new(format!(
-                "the introspection endpoint '{url}' is plain HTTP to '{}', which is not \
-                 loopback: the token and the client secret would cross the network in the \
-                 clear; use https",
+                "the introspection endpoint '{url}' is not https: the token and the client's \
+                 secret would be sent in the clear to whoever listens at '{}'",
                 endpoint.host()
             )));
         }
@@ -111,7 +108,8 @@ impl Http {
         self
     }
 
-    /// Authenticate to the endpoint as this client, with HTTP Basic.
+    /// Authenticate to the endpoint as this client with its secret, in HTTP
+    /// Basic.
     #[must_use]
     pub fn as_client(mut self, id: impl Into<String>, secret: impl Into<String>) -> Self {
         self.client = Some((id.into(), secret.into()));
@@ -141,26 +139,22 @@ impl Http {
                 AuthenticateError::new(format!("the introspection endpoint {failure}"))
             })?
             .into_iter()
-            .filter(|address| (self.online && self.endpoint.secure()) || address.ip().is_loopback())
+            .filter(|address| self.online || address.ip().is_loopback())
             .collect();
         if resolved.is_empty() {
             return Err(AuthenticateError::new(format!(
-                "'{host}' resolves to no loopback address, and the node is offline (ADR-0045) \
-                 or the endpoint is plain HTTP"
+                "'{host}' resolves to no loopback address, and the node is offline (ADR-0045)"
             )));
         }
         Ok(resolved)
     }
 
-    /// One exchange over `tcp`: in TLS where the endpoint is `https`.
+    /// One exchange over `tcp`, in TLS.
     fn exchange(
         &self,
         tcp: std::net::TcpStream,
         request: &Request,
     ) -> Result<http::Response, String> {
-        if !self.endpoint.secure() {
-            return http::exchange(tcp, request).map_err(|failure| failure.to_string());
-        }
         let host = self.endpoint.host();
         let guarded = match &self.trust {
             Some(config) => tls::client_with(host, tcp, Arc::clone(config)),
@@ -182,8 +176,8 @@ impl Http {
             .body(body.as_bytes());
         match &self.client {
             Some((id, secret)) => {
-                let credential = codec::base64::encode(format!("{id}:{secret}").as_bytes());
-                request.header("Authorization", &format!("Basic {credential}"))
+                let basic = codec::base64::encode(format!("{id}:{secret}").as_bytes());
+                request.header("Authorization", &format!("Basic {basic}"))
             }
             None => request,
         }
@@ -214,7 +208,7 @@ fn judged(answer: &http::Response) -> Result<String, AuthenticateError> {
             AuthenticateError::new(format!("the introspection endpoint's answer: {refused}"))
         }),
         401 | 403 => Err(AuthenticateError::new(format!(
-            "the authorization server refused this node's client credentials: '{status}'"
+            "the authorization server refused this node's client id and secret: '{status}'"
         ))),
         _ => Err(AuthenticateError::new(format!(
             "the introspection endpoint answered '{status}' and not 200"
@@ -227,17 +221,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plain_http_beyond_this_host_is_refused_when_it_is_configured_and_says_why() {
-        let failure = Http::at("http://as.example/introspect").expect_err("refused");
+    fn plain_http_is_refused_when_it_is_configured_loopback_included_and_says_why() {
+        for url in [
+            "http://as.example/introspect",
+            "http://127.0.0.1:9/introspect",
+            "http://localhost/introspect",
+            "http://[::1]:9000/introspect",
+        ] {
+            let failure = Http::at(url).expect_err("refused");
 
-        assert!(failure.message.contains("in the clear"), "{failure}");
+            assert!(failure.message.contains("is not https"), "{failure}");
+            assert!(failure.message.contains("in the clear"), "{failure}");
+        }
         assert!(Http::at("https://as.example/introspect").is_ok());
-        assert!(Http::at("http://127.0.0.1:9/introspect").is_ok());
+        assert!(Http::at("https://127.0.0.1:9/introspect").is_ok());
     }
 
     #[test]
     fn an_https_endpoint_is_asked_in_tls_and_answers_through_it() {
-        let signed = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        let signed = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
             .expect("a certificate");
         let config = tls::server_config(
             signed.cert.pem().as_bytes(),
@@ -259,7 +261,7 @@ mod tests {
         });
         let trust = tls::trusting(signed.cert.pem().as_bytes()).expect("a trust store");
 
-        let answer = Http::at(&format!("https://localhost:{port}/introspect"))
+        let answer = Http::at(&format!("https://127.0.0.1:{port}/introspect"))
             .expect("a URL")
             .trusting(Arc::new(trust))
             .introspect("t")
@@ -281,16 +283,16 @@ mod tests {
 
     #[test]
     fn a_url_is_read_into_host_port_and_path() {
-        let endpoint = Http::at("http://[::1]:9000/oauth/introspect").expect("a URL");
-        let plain = Http::at("http://localhost").expect("a URL");
+        let endpoint = Http::at("https://[::1]:9000/oauth/introspect").expect("a URL");
+        let bare = Http::at("https://localhost").expect("a URL");
 
         assert_eq!(endpoint.endpoint.authority(), "[::1]:9000");
         assert_eq!(endpoint.endpoint.path(), "/oauth/introspect");
-        assert_eq!((plain.endpoint.port(), plain.endpoint.path()), (80, "/"));
+        assert_eq!((bare.endpoint.port(), bare.endpoint.path()), (443, "/"));
     }
 
     #[test]
-    fn a_401_names_the_credentials_and_another_status_names_itself() {
+    fn a_401_names_the_client_secret_and_another_status_names_itself() {
         let answer = |status: u16, reason: &str| http::Response {
             status,
             reason: reason.to_string(),
@@ -301,7 +303,7 @@ mod tests {
             judged(&answer(401, "Unauthorized"))
                 .expect_err("refused")
                 .message
-                .contains("client credentials")
+                .contains("client id and secret")
         );
         assert!(
             judged(&answer(503, "Service Unavailable"))
@@ -313,7 +315,7 @@ mod tests {
 
     #[test]
     fn a_token_is_form_encoded_so_its_punctuation_survives_the_post() {
-        let request = Http::at("http://localhost/introspect")
+        let request = Http::at("https://localhost/introspect")
             .expect("a URL")
             .request("a+b/c=d.e-f");
 
