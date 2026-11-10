@@ -155,12 +155,8 @@ impl Http {
         tcp: std::net::TcpStream,
         request: &Request,
     ) -> Result<http::Response, String> {
-        let host = self.endpoint.host();
-        let guarded = match &self.trust {
-            Some(config) => tls::client_with(host, tcp, Arc::clone(config)),
-            None => tls::client(host, tcp),
-        }
-        .map_err(|failure| failure.message)?;
+        let guarded = tls::client_trusting(self.endpoint.host(), tcp, self.trust.as_ref())
+            .map_err(|failure| failure.message)?;
         http::exchange(guarded, request).map_err(|failure| failure.to_string())
     }
 
