@@ -10,8 +10,8 @@
 //! it off the `Authorization` header called it that. This gate posts the
 //! token to the introspection endpoint the configuration names and holds the
 //! answer to account: `active` is true, `exp` has not passed and `nbf` has
-//! come with the configured leeway, the issuer and audience are the expected
-//! ones where any are expected, every scope the node requires is in `scope`,
+//! come with the configured leeway, `iss` is the configured issuer and `aud`
+//! names the configured audience, every scope the node requires is in `scope`,
 //! and the subject — `sub`, or `client_id` where the token was issued to a
 //! client on its own behalf and has no `sub` — is the value that was claimed.
 //!
@@ -23,11 +23,14 @@
 //!
 //! The endpoint is asked in TLS, Xmip's own, and a plain `http` endpoint is
 //! refused when it is configured, loopback included (see [`introspection`]);
-//! the endpoint and the leeway are the `introspection_endpoint` and `leeway`
-//! settings declared in [`settings`]. The issuer, audience and window checks
-//! are the capability's (`authenticate::claims`), the ones `jwt`, `oidc` and
-//! `saml` make too; `exp` is held where the answer gives one, RFC 7662
-//! making it optional beside the server's own `active`. A JWT access token
+//! the endpoint, the issuer, the audience and the leeway are the
+//! `introspection_endpoint`, `issuer`, `audience` and `leeway` settings
+//! declared in [`settings`], the issuer and the audience required as `jwt`
+//! requires them: an answer naming no `iss`, or no `aud`, is refused. The
+//! issuer, audience and window checks are the capability's
+//! (`authenticate::claims`), the ones `jwt`, `oidc` and `saml` make too;
+//! `exp` is held where the answer gives one, RFC 7662 making it optional
+//! beside the server's own `active`. A JWT access token
 //! validated locally (RFC 9068) is `jwt`'s gate and not this one.
 //!
 //! What the server answered is learned and handed to the gate in the
@@ -50,7 +53,7 @@ pub mod settings;
 pub use introspection::{Http, Introspection};
 pub use settings::SETTINGS;
 
-use authenticate::claims;
+use authenticate::claims::{self, Expected};
 use authenticate::clock::{Clock, Window};
 use authenticate::{AuthenticateError, Authenticator, Conclusion};
 use context::Verified;
@@ -68,8 +71,7 @@ pub const CLIENT: &str = "oauth2.client";
 /// The oauth2 authenticator: where to ask, and what the answer must say.
 pub struct Verifier {
     server: Box<dyn Introspection>,
-    issuer: Option<String>,
-    audience: Option<String>,
+    expected: Expected,
     scopes: Vec<String>,
     principal: Option<UserPrincipalName>,
     client: Option<String>,
@@ -77,20 +79,6 @@ pub struct Verifier {
 }
 
 impl Verifier {
-    /// Refuse a token whose `iss` is not this.
-    #[must_use]
-    pub fn expecting_issuer(mut self, issuer: impl Into<String>) -> Self {
-        self.issuer = Some(issuer.into());
-        self
-    }
-
-    /// Refuse a token whose `aud` does not name this.
-    #[must_use]
-    pub fn expecting_audience(mut self, audience: impl Into<String>) -> Self {
-        self.audience = Some(audience.into());
-        self
-    }
-
     /// Refuse a token whose `scope` lacks this. May be said more than once.
     #[must_use]
     pub fn requiring_scope(mut self, scope: impl Into<String>) -> Self {
@@ -151,12 +139,9 @@ impl Verifier {
             &self.clock,
             Window::between(at("nbf"), at("exp")),
         )?;
-        if let Some(issuer) = &self.issuer {
-            claims::issued_by("the token", text("iss"), issuer)?;
-        }
-        if let Some(audience) = &self.audience {
-            claims::addressed_to("the token", audiences(answer.get("aud")), audience)?;
-        }
+        self.expected.issued("the token", text("iss"))?;
+        self.expected
+            .addressed("the token", audiences(answer.get("aud")))?;
         let granted: Vec<&str> = text("scope").unwrap_or_default().split(' ').collect();
         if let Some(missing) = self
             .scopes
@@ -347,20 +332,28 @@ mod tests {
         body.len() >= length
     }
 
-    fn active(extra: &str) -> String {
+    const ISSUER: &str = "https://as.example";
+
+    /// An active answer for `party-x` carrying only `claims` beside its
+    /// expiry: no `iss`, `aud` or `scope` unless `claims` gives them.
+    fn bare(claims: &str) -> String {
         let exp = NOW + 300;
-        format!(
-            concat!(
-                r#"{{"active":true,"sub":"party-x","#,
-                r#""scope":"orders:read orders:write","exp":{exp}{extra}}}"#
-            ),
-            exp = exp,
-            extra = extra
-        )
+        format!(r#"{{"active":true,"sub":"party-x","exp":{exp}{claims}}}"#)
+    }
+
+    /// An active answer from [`ISSUER`] for `xmip`, with two scopes.
+    fn active(extra: &str) -> String {
+        bare(&format!(
+            r#","iss":"{ISSUER}","aud":"xmip","scope":"orders:read orders:write"{extra}"#
+        ))
+    }
+
+    fn expected() -> Expected {
+        Expected::new(ISSUER, "xmip").expect("both")
     }
 
     fn verifier(endpoint: Http) -> Verifier {
-        Verifier::new(endpoint.as_client("xmip-node", "s3cret")).with_clock(|| NOW)
+        Verifier::new(endpoint.as_client("xmip-node", "s3cret"), expected()).with_clock(|| NOW)
     }
 
     fn presented(token: &str) -> Presented {
@@ -495,21 +488,42 @@ mod tests {
         assert!(failure.message.contains("expired"));
     }
 
-    #[test]
-    fn another_audience_is_refused_and_an_array_of_audiences_is_read() {
-        let (endpoint, _asked) = server("200 OK", active(r#","aud":["billing","xmip"]"#));
-        let (other, _asked_other) = server("200 OK", active(r#","aud":"billing""#));
+    /// What the gate says of an answer carrying `claims` beside its expiry.
+    fn judging(claims: &str) -> Result<Verified, AuthenticateError> {
+        let (endpoint, asked) = server("200 OK", bare(claims));
+        let verdict = verifier(endpoint).verify(&presented("token"));
+        asked.recv().expect("the server was asked");
+        verdict
+    }
 
-        let named = verifier(endpoint)
-            .expecting_audience("xmip")
-            .verify(&presented("token"));
-        let failure = verifier(other)
-            .expecting_audience("xmip")
-            .verify(&presented("token"))
-            .expect_err("refused");
+    #[test]
+    fn the_configured_issuer_and_an_array_naming_the_audience_are_proven() {
+        let named = judging(&format!(r#","iss":"{ISSUER}","aud":["billing","xmip"]"#));
 
         assert_eq!(named.expect("proven"), Verified::Proven);
-        assert!(failure.message.contains("audience"));
+    }
+
+    #[test]
+    fn an_answer_naming_no_issuer_or_another_is_refused_naming_the_one_expected() {
+        let missing = judging(r#","aud":"xmip""#).expect_err("no iss");
+        let other = judging(r#","iss":"https://other.example","aud":"xmip""#).expect_err("other");
+
+        for refused in [missing, other] {
+            assert_eq!(
+                refused.message,
+                "the token's issuer is not 'https://as.example'"
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_naming_no_audience_or_another_is_refused_naming_the_one_expected() {
+        let missing = judging(&format!(r#","iss":"{ISSUER}""#)).expect_err("no aud");
+        let other = judging(&format!(r#","iss":"{ISSUER}","aud":["billing"]"#)).expect_err("other");
+
+        for refused in [missing, other] {
+            assert_eq!(refused.message, "the token's audience does not name 'xmip'");
+        }
     }
 
     #[test]
@@ -527,7 +541,7 @@ mod tests {
     fn an_offline_node_does_not_call_a_server_beyond_itself() {
         let endpoint = Http::at("https://as.example/introspect").expect("a URL");
 
-        let failure = Verifier::new(endpoint)
+        let failure = Verifier::new(endpoint, expected())
             .verify(&presented("token"))
             .expect_err("refused");
 
@@ -536,7 +550,7 @@ mod tests {
 
     #[test]
     fn a_missing_proof_is_refused_by_name() {
-        let gate = Verifier::new(Http::at("https://127.0.0.1:9/").expect("a URL"));
+        let gate = Verifier::new(Http::at("https://127.0.0.1:9/").expect("a URL"), expected());
         let bare = Presented::passed(mechanism::oauth2(), "party-x");
 
         let missing = gate.verify(&bare).expect_err("refused");
