@@ -46,7 +46,8 @@ pub struct Http {
     client: Option<(String, String)>,
     online: bool,
     timeout: Duration,
-    trust: Option<Arc<tls::ClientConfig>>,
+    /// What the authorization server's certificate is checked by.
+    settings: tls::ClientSettings,
 }
 
 // The client secret does not belong in a log line; the client id says whose
@@ -88,7 +89,7 @@ impl Http {
             client: None,
             online: false,
             timeout: Duration::from_secs(5),
-            trust: None,
+            settings: tls::ClientSettings::native(),
         })
     }
 
@@ -97,7 +98,7 @@ impl Http {
     /// operating system's.
     #[must_use]
     pub fn trusting(mut self, config: Arc<tls::ClientConfig>) -> Self {
-        self.trust = Some(config);
+        self.settings = tls::ClientSettings::trusting(config);
         self
     }
 
@@ -155,7 +156,9 @@ impl Http {
         tcp: std::net::TcpStream,
         request: &Request,
     ) -> Result<http::Response, String> {
-        let guarded = tls::client_trusting(self.endpoint.host(), tcp, self.trust.as_ref())
+        let guarded = self
+            .settings
+            .client(self.endpoint.host(), tcp)
             .map_err(|failure| failure.message)?;
         http::exchange(guarded, request).map_err(|failure| failure.to_string())
     }
