@@ -17,7 +17,8 @@ always in Xmip's TLS in
 against the operating system's trust store or one the configuration gives. A
 plain `http` endpoint is refused when it is configured, loopback included:
 the token and the client's secret are never sent in the clear. The call is
-made only where configuration says the node is online or the endpoint is
+made only where the node may reach off its machine — it declares the Node
+capability `online` (ADR-0056, amendment 2026-11-24) — or the endpoint is
 loopback, and is refused saying why otherwise (ADR-0045). Local JWT
 access-token validation is `jwt`'s.
 
