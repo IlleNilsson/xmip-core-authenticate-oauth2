@@ -35,11 +35,6 @@ A configuration without the issuer or the audience, or with either empty, is
 refused when it is read, naming the setting, as `jwt` refuses it. The
 client's id and secret are given apart from these.
 
-## Toolchain
-
-`rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
-here.
-
 ## Verification
 
 The included workflow is manual-only and calls the versioned shared workflow at
