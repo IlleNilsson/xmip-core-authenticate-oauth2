@@ -14,22 +14,22 @@ path = "src/lib.rs"
 # A Technology depends on its parent Capability, never the reverse
 # (repository-model.md): authenticate for the trait and Presented, context
 # for Verified, xcore for the mechanism catalog.
-authenticate = { package = "xmip-core-authenticate", git = "https://github.com/IlleNilsson/xmip-core-authenticate", branch = "main" }
+authenticate = { workspace = true }
 # identify for the principal name types: no technology parses a principal
 # name itself (ADR-0054).
-identify = { package = "xmip-core-identify", git = "https://github.com/IlleNilsson/xmip-core-identify", branch = "main" }
-context = { package = "xmip-core-context", git = "https://github.com/IlleNilsson/xmip-core-context", branch = "main" }
-xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
+identify = { workspace = true }
+context = { workspace = true }
+xcore = { workspace = true }
 # RFC 7662 answers in JSON with a boolean and an `aud` of either shape;
 serde_json = "1"
 # The estate's base 64 (RFC 4648), which Basic client authentication travels in.
-codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
+codec = { workspace = true }
 # The endpoint, the minimal HTTP/1.1 client the call goes over, and the
 # percent-encoding of the token in the form body.
-net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
+net = { workspace = true }
 # The estate's TLS, which an https endpoint is asked in: the token and the
 # client secret never cross a network in the clear.
-tls = { package = "xmip-core-library-tls", git = "https://github.com/IlleNilsson/xmip-core-library-tls", branch = "main" }
+tls = { workspace = true }
 
 [dev-dependencies]
 # A self-signed certificate for the in-process authorization server the TLS
